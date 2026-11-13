@@ -149,16 +149,35 @@ await step('take a quiz → auto-graded', async () => {
   const r = (await api('POST', `/attempts/${attempt.id}/submit`, { token: student.access_token, body: { answers } })).data;
   return `score ${r.attempt.score}% (${r.correct_count}/${r.total})`;
 });
+
 await step('upcoming assignments + submit file', async () => {
   const list = (await api('GET', '/assignments/me', { token: student.access_token })).data.data;
   const open = list.find((a) => a.due_date && new Date(a.due_date) > new Date());
+
+  if (!open) {
+    throw new Error('No upcoming assignment found for smoke test');
+  }
+
   const form = new FormData();
   form.append('file', new Blob(['def quicksort(a): ...'], { type: 'text/plain' }), 'quicksort.py');
   form.append('comment', 'smoke test submission');
-  const s = (await api('POST', `/assignments/${open.id}/submit`, { token: student.access_token, form, expect: 201 })).data;
+
+  const s = (await api('POST', `/assignments/${open.id}/submit`, {
+    token: student.access_token,
+    form,
+    expect: 201
+  })).data;
+
+  console.log('Submission response:', JSON.stringify(s, null, 2));
+
+  if (!s.id) {
+    throw new Error('Submission ID missing from API response');
+  }
+
   ctx.submissionId = s.id;
   return open.title;
 });
+
 await step('badges, streak, leaderboard, recommendations', async () => {
   const b = (await api('GET', '/users/me/badges', { token: student.access_token })).data.data.filter((x) => x.earned).length;
   const lb = (await api('GET', `/leaderboard/${ctx.dsa.id}`, { token: student.access_token })).data;
