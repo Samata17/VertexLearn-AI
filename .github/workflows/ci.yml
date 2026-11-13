@@ -57,11 +57,19 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
 
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - name: Install backend dependencies
+        run: npm ci
 
+      - name: Backend typecheck
+        run: npm run typecheck
+
+      - name: Backend tests
+        run: npm test
+
+      - name: Backend build
+        run: npm run build
+
+      # Start SeaweedFS S3-compatible storage.
       - name: Start S3 storage (SeaweedFS)
         run: |
           docker run -d --name vertexlearn-s3 \
@@ -69,6 +77,24 @@ jobs:
             chrislusf/seaweedfs:3.80 \
             server -dir=/data -s3 -s3.port=8333 \
             -master.volumeSizeLimitMB=1024 -volume.max=0
+
+      # Wait until the S3 HTTP endpoint responds.
+      - name: Wait for S3 storage
+        run: |
+          for i in $(seq 1 60); do
+            if curl --connect-timeout 2 -sS -o /dev/null \
+              http://localhost:8333/; then
+              echo "SeaweedFS S3 endpoint is responding"
+              exit 0
+            fi
+
+            echo "Waiting for SeaweedFS... attempt $i/60"
+            sleep 2
+          done
+
+          echo "SeaweedFS failed to start"
+          docker logs vertexlearn-s3
+          exit 1
 
       - name: Migrate + seed
         run: npm run seed
@@ -83,7 +109,16 @@ jobs:
 
       - name: API log
         if: failure()
-        run: cat api.log
+        run: |
+          if [ -f api.log ]; then
+            cat api.log
+          else
+            echo "API log was not created. The API may not have started."
+          fi
+
+      - name: SeaweedFS logs
+        if: failure()
+        run: docker logs vertexlearn-s3 || true
 
   ai-service:
     runs-on: ubuntu-latest
@@ -101,8 +136,11 @@ jobs:
           cache: pip
           cache-dependency-path: ai-service/requirements.txt
 
-      - run: pip install -r requirements.txt
-      - run: python -m pytest -q
+      - name: Install AI service dependencies
+        run: pip install -r requirements.txt
+
+      - name: AI service tests
+        run: python -m pytest -q
 
   frontend:
     runs-on: ubuntu-latest
@@ -120,9 +158,14 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend typecheck
+        run: npm run typecheck
+
+      - name: Frontend build
+        run: npm run build
 
   full-stack:
     runs-on: ubuntu-latest
@@ -138,7 +181,9 @@ jobs:
       - name: Validate compose files
         run: |
           docker compose config --quiet
+
           node scripts/generate-secrets.mjs --dir ci-secrets
+
           SECRETS_DIR=./ci-secrets docker compose \
             -f docker-compose.yml \
             -f docker-compose.prod.yml \
@@ -155,6 +200,7 @@ jobs:
           for i in $(seq 1 60); do
             pending=$(docker compose exec -T postgres psql -U vertex vertexlearn -tAc \
               "SELECT count(*) FROM lectures WHERE ingest_status IN ('queued','processing')")
+
             chunks=$(docker compose exec -T postgres psql -U vertex vertexlearn -tAc \
               "SELECT count(*) FROM document_chunks")
 
@@ -182,7 +228,9 @@ jobs:
 
       - name: Logs
         if: failure()
-        run: docker compose ps && docker compose logs --tail 200
+        run: |
+          docker compose ps
+          docker compose logs --tail 200
 
       - name: Stop
         if: always()
