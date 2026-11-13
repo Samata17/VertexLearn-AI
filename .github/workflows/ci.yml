@@ -70,8 +70,6 @@ jobs:
             server -dir=/data -s3 -s3.port=8333 \
             -master.volumeSizeLimitMB=1024 -volume.max=0
 
-          npx --yes wait-on --timeout 60000 http://localhost:8333/healthz
-
       - name: Migrate + seed
         run: npm run seed
 
