@@ -30,6 +30,12 @@ jobs:
     env:
       DATABASE_URL: postgres://vertex:vertex@localhost:5432/vertexlearn
       REDIS_URL: redis://localhost:6379
+      S3_ENDPOINT: http://localhost:8333
+      S3_REGION: us-east-1
+      S3_BUCKET: vertexlearn
+      S3_ACCESS_KEY: vertexlearn
+      S3_SECRET_KEY: vertexlearn-secret
+      S3_FORCE_PATH_STYLE: 'true'
     defaults: { run: { working-directory: backend } }
     steps:
       - uses: actions/checkout@v4
