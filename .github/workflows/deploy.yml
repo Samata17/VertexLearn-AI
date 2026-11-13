@@ -1,11 +1,5 @@
-# PRD 14.2 steps 2–3:
-#  - CI passed on a push to main → build images tagged with the commit SHA, push to GitHub Container Registry,
-#    deploy to staging. (Triggered by the CI workflow finishing, and only if it SUCCEEDED — a failing test can no
-#    longer reach staging.)
-#  - tag v*        → promote the same images to production (no rebuild — PRD 14.5 rollback = redeploy an older tag)
-#
-# Deployment target is intentionally generic: set the STAGING_DEPLOY_HOOK / PRODUCTION_DEPLOY_HOOK secrets to
-# your platform's deploy webhook (Render, Railway, a VM running `docker compose pull && up -d`, ECS, ...).
+
+# PRD 14.2 steps 2–3: Build, push and deploy VertexLearn AI.
 name: Deploy
 
 on:
@@ -21,7 +15,8 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  # Must be lowercase for GitHub Container Registry.
+  REGISTRY: ghcr.io/samata17
 
 jobs:
   images:
@@ -30,24 +25,33 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
         include:
           - { name: backend, context: backend, file: backend/Dockerfile }
           - { name: ai-service, context: ai-service, file: ai-service/Dockerfile }
           - { name: frontend, context: ., file: frontend/Dockerfile }
+
     steps:
-      # Build exactly the commit CI tested (not whatever main points at now).
+      # Build exactly the commit tested by CI.
       - uses: actions/checkout@v4
-        with: { ref: '${{ github.event.workflow_run.head_sha }}' }
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
       - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           push: true
-          build-args: GIT_SHA=${{ github.event.workflow_run.head_sha }}
+          build-args: |
+            GIT_SHA=${{ github.event.workflow_run.head_sha }}
           tags: |
             ${{ env.REGISTRY }}/vertexlearn-${{ matrix.name }}:${{ github.event.workflow_run.head_sha }}
             ${{ env.REGISTRY }}/vertexlearn-${{ matrix.name }}:staging
@@ -56,30 +60,46 @@ jobs:
     needs: images
     runs-on: ubuntu-latest
     environment: staging
+
     env:
       HOOK: ${{ secrets.STAGING_DEPLOY_HOOK }}
+
     steps:
       - name: Trigger staging deploy
         if: env.HOOK != ''
-        run: curl -fsS -X POST "$HOOK?tag=${{ github.event.workflow_run.head_sha }}"
+        run: |
+          curl -fsS -X POST "${HOOK}?tag=${{ github.event.workflow_run.head_sha }}"
+
       - name: Smoke test staging
         if: ${{ vars.STAGING_URL != '' }}
-        run: curl -fsS "${{ vars.STAGING_URL }}/health"
+        run: |
+          curl -fsS "${{ vars.STAGING_URL }}/health"
 
   promote-production:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: production
+
     env:
       HOOK: ${{ secrets.PRODUCTION_DEPLOY_HOOK }}
+
     steps:
       - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Retag the tested commit image as the release
         run: |
           for svc in backend ai-service frontend; do
-            docker buildx imagetools create -t $REGISTRY/vertexlearn-$svc:${GITHUB_REF_NAME} -t $REGISTRY/vertexlearn-$svc:production $REGISTRY/vertexlearn-$svc:${GITHUB_SHA}
+            docker buildx imagetools create \
+              -t "$REGISTRY/vertexlearn-$svc:${GITHUB_REF_NAME}" \
+              -t "$REGISTRY/vertexlearn-$svc:production" \
+              "$REGISTRY/vertexlearn-$svc:${GITHUB_SHA}"
           done
+
       - name: Trigger production deploy
         if: env.HOOK != ''
-        run: curl -fsS -X POST "$HOOK?tag=${{ github.ref_name }}"
+        run: |
+          curl -fsS -X POST "${HOOK}?tag=${{ github.ref_name }}"
