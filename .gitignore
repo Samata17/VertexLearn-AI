@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+frontend/test-results/
+frontend/playwright-report/
+.DS_Store
+
+# Secrets — never commit these
+.env
+.env.production
+.env.*.local
+secrets/
+infra/gcp/*.json
+*service-account*.json
+application_default_credentials.json
+.deployed-tag

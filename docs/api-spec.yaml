@@ -1,0 +1,488 @@
+openapi: 3.0.3
+info:
+  title: VertexLearn AI — Core LMS API
+  version: 1.0.0
+  description: |
+    REST API of the VertexLearn AI learning platform (PRD Section 8).
+    Base URL `/api/v1`. All endpoints except auth, the public catalog, file streaming and certificate
+    verification require `Authorization: Bearer <access_token>`.
+
+    **Errors** always use the PRD 8.8 format: `{ "error": { "code": "VALIDATION_ERROR", "message": "...", "field": "email" } }`.
+
+    **Rate limits** (PRD 8.9): credential endpoints 10/min/IP · session endpoints 60/min/IP ·
+    AI tutor 20/min/user · everything else 100/min/user. Exceeding them returns `429 RATE_LIMITED`.
+
+    **Roles**: `student`, `instructor`, `admin`. "Owner" means the instructor who created the course (admins pass every ownership check).
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Docker stack (through nginx)
+  - url: http://localhost:4000/api/v1
+    description: Backend directly
+security:
+  - bearer: []
+tags:
+  - name: Auth
+  - name: Courses
+  - name: Enrollment & Progress
+  - name: Assignments
+  - name: Quizzes
+  - name: AI Tutor
+  - name: Gamification
+  - name: Discussions & Announcements
+  - name: Notifications
+  - name: Dashboards
+  - name: Admin
+  - name: Users & Files
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: Error in PRD 8.8 format
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string, example: 'email: must be a valid email address' }
+            field: { type: string, example: email }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string }
+        email: { type: string }
+        avatar_url: { type: string, nullable: true }
+        roles: { type: array, items: { type: string, enum: [student, instructor, admin] } }
+        role: { type: string, description: 'Primary (highest) role — drives the dashboard redirect' }
+    Session:
+      type: object
+      properties:
+        access_token: { type: string, description: 'JWT, valid 15 minutes' }
+        refresh_token: { type: string, description: 'Opaque token, valid 7 days, rotated on every refresh' }
+        user: { $ref: '#/components/schemas/User' }
+    Course:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string }
+        category: { type: string }
+        difficulty: { type: string, enum: [beginner, intermediate, advanced] }
+        price: { type: number }
+        status: { type: string, enum: [pending, approved, rejected, archived] }
+        thumbnail_url: { type: string, nullable: true }
+        rating: { type: number }
+        review_count: { type: integer }
+        enrollment_count: { type: integer }
+        lecture_count: { type: integer }
+        total_seconds: { type: integer }
+    QuizQuestionInput:
+      type: object
+      required: [question_text, question_type, options]
+      properties:
+        question_text: { type: string }
+        question_type: { type: string, enum: [mcq, multi_select, short_answer] }
+        explanation: { type: string }
+        options:
+          type: array
+          description: For short_answer, every option is an accepted answer (is_correct = true).
+          items: { type: object, properties: { option_text: { type: string }, is_correct: { type: boolean } } }
+    Source:
+      type: object
+      properties:
+        index: { type: integer, description: 'Matches [n] citations in the reply' }
+        lecture_id: { type: string, format: uuid }
+        lecture_title: { type: string }
+        module_title: { type: string }
+        timestamp_seconds: { type: integer, nullable: true }
+        source_type: { type: string, enum: [transcript, pdf, text] }
+        source_name: { type: string, nullable: true }
+        snippet: { type: string }
+
+paths:
+  # ---------------------------------------------------------------- Auth
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Register (default role student; `instructor` may be requested, `admin` never)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, email, password]
+              properties:
+                full_name: { type: string }
+                email: { type: string }
+                password: { type: string, description: '8+ chars, a letter and a number' }
+                role: { type: string, enum: [student, instructor] }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Returns access + refresh token
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: string, example: ananya@example.com }, password: { type: string, example: Password123! } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { description: Account suspended }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Exchange a refresh token for a new token pair (old refresh token is revoked)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { refresh_token: { type: string } } } } } }
+      responses: { '200': { description: New session }, '401': { $ref: '#/components/responses/Error' } }
+  /auth/logout:
+    post: { tags: [Auth], security: [], summary: Invalidate a refresh token, responses: { '200': { description: OK } } }
+  /auth/me:
+    get: { tags: [Auth], summary: Current user profile, responses: { '200': { description: OK } } }
+  /auth/forgot-password:
+    post: { tags: [Auth], security: [], summary: Email a 30-minute reset link (always responds 200), responses: { '200': { description: OK } } }
+  /auth/reset-password:
+    post: { tags: [Auth], security: [], summary: 'Set a new password with { token, password }; signs out all sessions', responses: { '200': { description: OK }, '400': { $ref: '#/components/responses/Error' } } }
+
+  # ---------------------------------------------------------------- Courses
+  /courses:
+    get:
+      tags: [Courses]
+      security: []
+      summary: Public catalog (approved courses), cached 5 min in Redis
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: difficulty, in: query, schema: { type: string, enum: [beginner, intermediate, advanced] } }
+        - { name: min_rating, in: query, schema: { type: number } }
+        - { name: price, in: query, schema: { type: string, enum: [free, paid] } }
+        - { name: sort, in: query, schema: { type: string, enum: [popular, rating, newest, price_asc, price_desc] } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+      responses: { '200': { description: 'Paginated { data, page, limit, total, total_pages }' } }
+    post:
+      tags: [Courses]
+      summary: Create a course (instructor/admin) — status starts as pending
+      responses: { '201': { description: Created } }
+  /courses/categories:
+    get: { tags: [Courses], security: [], summary: Categories with counts, responses: { '200': { description: OK } } }
+  /courses/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    get: { tags: [Courses], security: [], summary: 'Course detail with modules/lectures (non-approved courses only for owner/admin); includes your enrollment when signed in', responses: { '200': { description: OK } } }
+    put: { tags: [Courses], summary: 'Update metadata (owner). Also { archived: bool } and { resubmit: true } after rejection', responses: { '200': { description: OK } } }
+    delete: { tags: [Courses], summary: 'Delete (owner; admins only if students are enrolled)', responses: { '200': { description: OK }, '409': { description: Has students — archive instead } } }
+  /courses/{id}/thumbnail:
+    post: { tags: [Courses], summary: 'Upload thumbnail (multipart field "thumbnail", image ≤ 5 MB)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /courses/{id}/approve:
+    post:
+      tags: [Courses, Admin]
+      summary: Approve or reject a course (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { decision: { type: string, enum: [approved, rejected] }, comment: { type: string } } } } } }
+      responses: { '200': { description: OK } }
+  /courses/{id}/reviews:
+    get: { tags: [Courses], security: [], summary: List reviews, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [Courses], summary: 'Rate a course { rating 1-5, comment } (enrolled students)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: OK } } }
+  /courses/{id}/modules:
+    post: { tags: [Courses], summary: Add module (owner), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /courses/{id}/modules/reorder:
+    put: { tags: [Courses], summary: 'Reorder modules { ids: [...] }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /modules/{id}:
+    put: { tags: [Courses], summary: Rename module, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Courses], summary: Delete module, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /modules/{id}/lectures:
+    post:
+      tags: [Courses]
+      summary: Add lecture (multipart upload) — queues RAG ingestion when a transcript or documents are present
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                transcript: { type: string }
+                duration_seconds: { type: integer }
+                video: { type: string, format: binary, description: 'mp4/webm/mov ≤ 500 MB' }
+                video_url: { type: string, description: Alternative to uploading }
+                resources: { type: array, items: { type: string, format: binary }, description: 'pdf/ppt(x)/doc(x)/txt/md' }
+      responses: { '201': { description: Created } }
+  /modules/{id}/lectures/reorder:
+    put: { tags: [Courses], summary: Reorder lectures, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /lectures/{id}:
+    get: { tags: [Enrollment & Progress], summary: 'Player data: lecture (signed video URL), resources, progress, notes, bookmarks, prev/next (enrolled or owner)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    put: { tags: [Courses], summary: 'Update lecture (multipart; remove_resources JSON array, remove_video)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Courses], summary: Delete lecture, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /lectures/{id}/ingest:
+    post: { tags: [AI Tutor], summary: Re-index a lecture for the AI tutor (owner), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: Queued } } }
+  /instructor/courses:
+    get: { tags: [Courses], summary: My courses (instructor), responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Enrollment & progress
+  /courses/{id}/enroll:
+    post:
+      tags: [Enrollment & Progress]
+      summary: Enroll current student. Paid courses need { confirm_demo_payment true } (demo checkout — no real payment)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '201': { description: Enrolled }, '402': { description: Paid course needs confirmation }, '409': { description: Already enrolled } }
+  /enrollments/me:
+    get: { tags: [Enrollment & Progress], summary: My enrolled courses with progress and next lecture, responses: { '200': { description: OK } } }
+  /lectures/{id}/progress:
+    post:
+      tags: [Enrollment & Progress]
+      summary: 'Save { position_seconds, delta_seconds, completed? }. Auto-completes at 90% watched; 100% course completion issues a certificate'
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '200': { description: 'Progress row + just_completed, progress_percent' } }
+  /lectures/{id}/notes:
+    get: { tags: [Enrollment & Progress], summary: My notes on a lecture, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [Enrollment & Progress], summary: 'Add note { content, timestamp_seconds }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /notes/{id}:
+    put: { tags: [Enrollment & Progress], summary: Edit note, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Enrollment & Progress], summary: Delete note, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /notes/me:
+    get: { tags: [Enrollment & Progress], summary: 'All my notes (?q= search)', responses: { '200': { description: OK } } }
+  /lectures/{id}/bookmarks:
+    get: { tags: [Enrollment & Progress], summary: My bookmarks on a lecture, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [Enrollment & Progress], summary: 'Add bookmark { timestamp_seconds, label? }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /bookmarks/{id}:
+    delete: { tags: [Enrollment & Progress], summary: Delete bookmark, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /bookmarks/me:
+    get: { tags: [Enrollment & Progress], summary: All my bookmarks, responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Assignments
+  /assignments:
+    post: { tags: [Assignments], summary: 'Create { course_id, title, instructions, rubric[{criterion,points}], due_date, max_score } (owner)', responses: { '201': { description: Created } } }
+  /assignments/me:
+    get: { tags: [Assignments], summary: Assignments across my enrolled courses with my submission, responses: { '200': { description: OK } } }
+  /assignments/{id}:
+    get: { tags: [Assignments], summary: Assignment detail + my submission, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    put: { tags: [Assignments], summary: Update (owner), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Assignments], summary: Delete (owner), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /courses/{id}/assignments:
+    get: { tags: [Assignments], summary: Course assignments, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /assignments/{id}/submit:
+    post:
+      tags: [Assignments]
+      summary: 'Submit file (multipart "file": pdf/zip/code/ipynb/docx ≤ 50 MB, optional "comment"). Rejected after the deadline; resubmitting replaces the file'
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses: { '201': { description: Submitted }, '400': { $ref: '#/components/responses/Error' } }
+  /assignments/{id}/submissions:
+    get: { tags: [Assignments], summary: Submissions for an assignment (owner), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /instructor/submissions:
+    get: { tags: [Assignments], summary: 'Grading queue (?status=pending|graded|all&assignment=)', responses: { '200': { description: OK } } }
+  /submissions/{id}/grade:
+    put: { tags: [Assignments], summary: 'Grade { grade, feedback } (owner) — notifies the student', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Quizzes
+  /quizzes:
+    post:
+      tags: [Quizzes]
+      summary: Create quiz manually (owner)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                module_id: { type: string, format: uuid }
+                title: { type: string }
+                time_limit_minutes: { type: integer, nullable: true }
+                status: { type: string, enum: [draft, published] }
+                questions: { type: array, items: { $ref: '#/components/schemas/QuizQuestionInput' } }
+      responses: { '201': { description: Created } }
+  /quizzes/me:
+    get: { tags: [Quizzes], summary: Published quizzes in my courses with my best score, responses: { '200': { description: OK } } }
+  /quizzes/{id}:
+    get: { tags: [Quizzes], summary: 'Owners get full quiz with answers; students get metadata + their attempts', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    put: { tags: [Quizzes], summary: 'Update / replace questions / publish (draft → published notifies students)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Quizzes], summary: Delete, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /courses/{id}/quizzes:
+    get: { tags: [Quizzes], summary: Course quizzes (owners also see drafts), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /quizzes/{id}/attempt:
+    post: { tags: [Quizzes], summary: Start an attempt (student) — returns questions without answers, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Started } } }
+  /attempts/{id}/submit:
+    post:
+      tags: [Quizzes]
+      summary: Submit answers → auto-graded score, per-question results, mastery update
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                answers:
+                  type: array
+                  items: { type: object, properties: { question_id: { type: string }, selected_option_ids: { type: array, items: { type: string } }, text_answer: { type: string } } }
+      responses: { '200': { description: Graded result } }
+  /attempts/me:
+    get: { tags: [Quizzes], summary: 'My quiz score history (?course_id=)', responses: { '200': { description: OK } } }
+  /attempts/{id}:
+    get: { tags: [Quizzes], summary: Attempt result with correct answers, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /mastery/me:
+    get: { tags: [Quizzes], summary: My per-topic (module) mastery scores, responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- AI Tutor
+  /ai/status:
+    get: { tags: [AI Tutor], summary: '{ available, mode: live|demo|unavailable, model }', responses: { '200': { description: OK } } }
+  /ai/chat/sessions:
+    get: { tags: [AI Tutor], summary: 'My chat sessions (?course_id=)', responses: { '200': { description: OK } } }
+    post: { tags: [AI Tutor], summary: 'Start a session scoped to a course { course_id, mode? } — default mode follows topic mastery', responses: { '201': { description: Created } } }
+  /ai/chat/sessions/{id}:
+    get: { tags: [AI Tutor], summary: Session with messages, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [AI Tutor], summary: Delete session, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /ai/chat/sessions/{id}/messages:
+    post:
+      tags: [AI Tutor]
+      summary: Send a message, get a RAG-grounded reply with sources (20/min/user)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { message: { type: string, example: 'Why does quicksort degrade to O(n^2) on sorted input?' }, lecture_id: { type: string, description: 'Lecture being watched (optional)' } } } } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply: { type: string }
+                  sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+                  mode: { type: string }
+                  is_demo: { type: boolean, description: 'true when the answer was built in demo mode (Vertex AI not configured, or temporarily unavailable)' }
+  /ai/chat/sessions/{id}/mode:
+    put: { tags: [AI Tutor], summary: 'Switch explanation mode { mode: beginner|intermediate|advanced }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /ai/lectures/{id}/summarize:
+    post: { tags: [AI Tutor], summary: '{ summary, key_points[], key_terms[] } (cached 6 h)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /ai/lectures/{id}/generate-quiz:
+    post: { tags: [AI Tutor], summary: 'Generate a 3–10 question DRAFT quiz from the transcript { num_questions, difficulty } (owner)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Draft quiz } } }
+  /ai/modules/{id}/flashcards:
+    get: { tags: [AI Tutor], summary: Module flashcard deck, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [AI Tutor], summary: 'Generate deck { count, regenerate? } (students get the shared deck; owners can regenerate)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /ai/study-plan:
+    get: { tags: [AI Tutor], summary: 'My study plans (?course_id=)', responses: { '200': { description: OK } } }
+    post: { tags: [AI Tutor], summary: 'Generate a plan { course_id, weeks, hours_per_week, goal? } from quiz history & mastery', responses: { '201': { description: Created } } }
+
+  # ---------------------------------------------------------------- Gamification
+  /recommendations/me:
+    get: { tags: [Gamification], summary: 'Course recommendations (rule-based + embedding similarity) and weak topics', responses: { '200': { description: OK } } }
+  /users/me/badges:
+    get: { tags: [Gamification], summary: All badges with earned flag, responses: { '200': { description: OK } } }
+  /users/me/streak:
+    get: { tags: [Gamification], summary: Current/longest streak + 90-day activity, responses: { '200': { description: OK } } }
+  /leaderboard:
+    get: { tags: [Gamification], summary: Global leaderboard (cached 60 s), responses: { '200': { description: OK } } }
+  /leaderboard/{courseId}:
+    get: { tags: [Gamification], summary: Course leaderboard, parameters: [{ name: courseId, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /certificates/me:
+    get: { tags: [Gamification], summary: My certificates (+ completed courses still generating), responses: { '200': { description: OK } } }
+  /certificates/{id}/download:
+    get: { tags: [Gamification], summary: Download certificate PDF, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: application/pdf } } }
+  /certificates/generate/{courseId}:
+    post: { tags: [Gamification], summary: Generate now (if the worker hasn't yet), parameters: [{ name: courseId, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /certificates/verify/{code}:
+    get: { tags: [Gamification], security: [], summary: Public certificate verification, parameters: [{ name: code, in: path, required: true, schema: { type: string } }], responses: { '200': { description: Valid }, '404': { description: Not found } } }
+
+  # ---------------------------------------------------------------- Discussions
+  /courses/{id}/threads:
+    get: { tags: [Discussions & Announcements], summary: 'Threads (?q=)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [Discussions & Announcements], summary: 'New thread { title, content }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /threads/{id}:
+    get: { tags: [Discussions & Announcements], summary: Thread with flat post list (parent_post_id builds the tree), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Discussions & Announcements], summary: Delete (author, course owner, admin), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /threads/{id}/posts:
+    post: { tags: [Discussions & Announcements], summary: 'Reply { content, parent_post_id? }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /posts/{id}:
+    put: { tags: [Discussions & Announcements], summary: Edit own post, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Discussions & Announcements], summary: Delete (author or moderator), parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /posts/{id}/report:
+    post: { tags: [Discussions & Announcements], summary: 'Report { reason }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /posts/{id}/moderate:
+    put: { tags: [Discussions & Announcements], summary: '{ action: dismiss|hide|unhide|delete } (course owner or admin)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /instructor/flagged-posts:
+    get: { tags: [Discussions & Announcements], summary: Reported posts in my courses, responses: { '200': { description: OK } } }
+  /courses/{id}/announcements:
+    get: { tags: [Discussions & Announcements], summary: Course announcements, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    post: { tags: [Discussions & Announcements], summary: 'Post { title, content, email? } — notifies all enrolled students', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '201': { description: Created } } }
+  /announcements/{id}:
+    delete: { tags: [Discussions & Announcements], summary: Delete announcement, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /announcements/me:
+    get: { tags: [Discussions & Announcements], summary: Announcements from my courses, responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Notifications
+  /notifications:
+    get: { tags: [Notifications], summary: 'Latest 50 + unread_count (?unread=true)', responses: { '200': { description: OK } } }
+  /notifications/read-all:
+    put: { tags: [Notifications], summary: Mark all read, responses: { '200': { description: OK } } }
+  /notifications/{id}/read:
+    put: { tags: [Notifications], summary: Mark one read, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /notifications/{id}:
+    delete: { tags: [Notifications], summary: Delete, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Dashboards
+  /dashboard/student:
+    get: { tags: [Dashboards], summary: 'Everything the student dashboard needs (stats, streak, activity, continue learning, upcoming assignments, quiz trend, recent activity, announcements, mastery, badges)', responses: { '200': { description: OK } } }
+  /instructor/analytics/overview:
+    get: { tags: [Dashboards], summary: Instructor KPIs, enrollment trend, courses, recent submissions, AI drafts to review, responses: { '200': { description: OK } } }
+  /instructor/courses/{id}/analytics:
+    get: { tags: [Dashboards], summary: 'Per-lecture drop-off, time-on-task, quiz scores, topic struggle, students (owner)', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Admin
+  /admin/users:
+    get: { tags: [Admin], summary: 'List/search users (?q, role, status=active|suspended, page)', responses: { '200': { description: OK } } }
+  /admin/users/{id}:
+    get: { tags: [Admin], summary: User detail with enrollments, courses and audit trail, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+    delete: { tags: [Admin], summary: Soft-delete (anonymise) an account, parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /admin/users/{id}/role:
+    put: { tags: [Admin], summary: 'Set roles { roles: [student|instructor|admin] } — signs the user out', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /admin/users/{id}/suspend:
+    put: { tags: [Admin], summary: '{ suspended: bool, reason? } — takes effect immediately', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /admin/courses/pending:
+    get: { tags: [Admin], summary: Approval queue, responses: { '200': { description: OK } } }
+  /admin/courses:
+    get: { tags: [Admin], summary: 'All courses (?status, q)', responses: { '200': { description: OK } } }
+  /admin/analytics/overview:
+    get: { tags: [Admin], summary: 'Platform metrics: users by role, DAU/MAU, enrollments, completion rate, revenue, 30-day trends', responses: { '200': { description: OK } } }
+  /admin/analytics/revenue:
+    get: { tags: [Admin], summary: Monthly revenue, revenue by course, recent transactions (demo payments), responses: { '200': { description: OK } } }
+  /admin/moderation/flagged-posts:
+    get: { tags: [Admin], summary: Reported forum posts platform-wide, responses: { '200': { description: OK } } }
+  /admin/moderation/posts/{id}:
+    put: { tags: [Admin], summary: '{ action: dismiss|hide|unhide|delete }', parameters: [{ $ref: '#/components/parameters/id' }], responses: { '200': { description: OK } } }
+  /admin/notifications:
+    post: { tags: [Admin], summary: 'Broadcast { title, body, audience: all|students|instructors, email? }', responses: { '201': { description: '{ sent }' } } }
+  /admin/notifications/history:
+    get: { tags: [Admin], summary: Recent broadcasts, responses: { '200': { description: OK } } }
+  /admin/audit-logs:
+    get: { tags: [Admin], summary: Audit log (paginated), responses: { '200': { description: OK } } }
+
+  # ---------------------------------------------------------------- Users & files
+  /users/me:
+    put: { tags: [Users & Files], summary: 'Update { full_name, bio }', responses: { '200': { description: OK } } }
+  /users/me/avatar:
+    post: { tags: [Users & Files], summary: 'Upload avatar (multipart "avatar", image ≤ 3 MB)', responses: { '200': { description: OK } } }
+  /users/me/password:
+    put: { tags: [Users & Files], summary: 'Change password { current_password, new_password }', responses: { '200': { description: OK } } }
+  /files/stream:
+    get:
+      tags: [Users & Files]
+      security: []
+      summary: 'Stream a private file via a signed, expiring URL (?key&exp&sig[&download=1]). Supports HTTP Range (video seeking)'
+      responses: { '200': { description: File }, '206': { description: Partial content }, '403': { description: Bad or expired signature } }
+  /health:
+    get: { tags: [Users & Files], security: [], summary: 'Health check { status, database, redis }', responses: { '200': { description: OK }, '503': { description: Degraded } } }

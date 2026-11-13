@@ -1,0 +1,172 @@
+# VertexLearn AI — shared service definitions (PRD 14.1).
+#
+# This file is never used on its own. Pair it with ONE of:
+#
+#   Development (automatic):  docker compose up -d --build
+#       → also loads docker-compose.override.yml: dev defaults, demo data, Mailpit, ports on 127.0.0.1
+#
+#   Staging / production:     docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.production up -d
+#       → docker-compose.prod.yml: Docker secrets, no demo data, no internal ports, resource limits
+#
+# What lives here: images/builds, health checks, start-up order and NON-secret settings.
+# Secrets (passwords, JWT keys, API keys) are only ever set by the two files above.
+
+name: vertexlearn
+
+# Non-secret settings shared by the API and the worker (they run the same code).
+x-app-config: &app-config
+  PORT: 4000
+  APP_URL: ${APP_URL:-http://localhost:8080}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:5173}
+  AI_SERVICE_URL: http://ai-service:8000
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://s3:8333}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_BUCKET: ${S3_BUCKET:-vertexlearn}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-vertexlearn}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+  SMTP_HOST: ${SMTP_HOST:-mailpit}
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  SMTP_USER: ${SMTP_USER:-}
+  MAIL_FROM: ${MAIL_FROM:-VertexLearn AI <no-reply@vertexlearn.local>}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-500}
+  AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-10}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  TRUST_PROXY: ${TRUST_PROXY:-1}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vertex
+      POSTGRES_DB: vertexlearn
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vertex -d vertexlearn"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes: [redisdata:/data] # keeps queued jobs and token block-lists across restarts
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # S3-compatible object storage (videos, PDFs, submissions, certificates).
+  # SeaweedFS is used because MinIO no longer publishes free container images.
+  # In production you can point S3_* at AWS S3 instead — the code uses the standard AWS S3 SDK.
+  s3:
+    image: chrislusf/seaweedfs:3.80
+    restart: unless-stopped
+    command: server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=1024 -volume.max=0
+    volumes: [s3data:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # AI Tutor service (Python/FastAPI). Isolated from the core API (PRD 14.4): the API stays up if this is down.
+  ai-service:
+    build: ./ai-service
+    restart: unless-stopped
+    environment:
+      # Google Cloud Vertex AI (Gemini). Empty GOOGLE_CLOUD_PROJECT = clearly-labelled demo mode.
+      # Credentials (ADC) are wired up per environment in the override / prod files.
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+      VERTEX_MODEL: ${VERTEX_MODEL:-gemini-3.8-flash}
+      VERTEX_THINKING_BUDGET: ${VERTEX_THINKING_BUDGET:-}
+      VERTEX_FALLBACK_TO_DEMO: ${VERTEX_FALLBACK_TO_DEMO:-true}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://s3:8333}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-vertexlearn}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-vertexlearn}
+    depends_on:
+      postgres: { condition: service_healthy }
+      s3: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  # Core LMS API. Applies database migrations on start (safe with several replicas — they take turns).
+  # Demo data is loaded only when SEED_DEMO_DATA=true (development) and the database is empty.
+  backend:
+    build:
+      context: ./backend
+      args: { GIT_SHA: "${GIT_SHA:-dev}" }
+    restart: unless-stopped
+    init: true # tini as PID 1: forwards stop signals so in-flight requests finish (graceful shutdown)
+    environment:
+      <<: *app-config
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        node dist/db/migrate.js
+        if [ "$${SEED_DEMO_DATA:-false}" = "true" ]; then node dist/db/seeders/seed.js --if-empty; fi
+        exec node dist/server.js
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      s3: { condition: service_healthy }
+    healthcheck:
+      # /health/ready → 200 only when the database and Redis answer.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 90s # first boot runs migrations (and the demo seed in development)
+      retries: 6
+
+  # Background worker (PRD 9.1 "Notification Service", 9.3 job types): AI indexing, certificates, email, cron.
+  worker:
+    build:
+      context: ./backend
+      args: { GIT_SHA: "${GIT_SHA:-dev}" }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *app-config
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      backend: { condition: service_healthy } # backend has finished migrations
+      redis: { condition: service_healthy }
+      ai-service: { condition: service_healthy } # ingest jobs call the AI service
+    healthcheck:
+      # The worker has no HTTP port; it touches /tmp/worker-heartbeat every 15 s while Redis answers.
+      test: ["CMD", "node", "-e", "const s=require('fs').statSync('/tmp/worker-heartbeat');process.exit(Date.now()-s.mtimeMs<60000?0:1)"]
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # Gateway (PRD 9.1): nginx serves the React app and proxies /api to the backend.
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args: { GIT_SHA: "${GIT_SHA:-dev}" }
+    restart: unless-stopped
+    ports: ["${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8080}:8080"]
+    depends_on:
+      backend: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:
+  s3data:

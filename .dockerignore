@@ -1,0 +1,13 @@
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/__pycache__
+**/test-results
+**/playwright-report
+.git
+docs
+secrets
+infra/gcp
+**/*service-account*.json
+**/application_default_credentials.json

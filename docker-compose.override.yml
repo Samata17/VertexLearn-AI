@@ -1,0 +1,64 @@
+# VertexLearn AI — LOCAL DEVELOPMENT settings.
+#
+# Docker Compose loads this file automatically on top of docker-compose.yml when you run
+#   docker compose up -d --build
+#
+# It adds: development secrets (safe defaults, overridable from .env), demo data, Mailpit (fake inbox),
+# and ports for debugging tools. Ports are bound to 127.0.0.1 so they are reachable from this
+# computer only — not from other devices on your network.
+#
+# NEVER use this file on a server. Production uses docker-compose.prod.yml instead.
+
+x-dev-secrets: &dev-secrets
+  NODE_ENV: development
+  SEED_DEMO_DATA: "true"
+  DATABASE_URL: postgresql://vertex:${POSTGRES_PASSWORD:-vertex}@postgres:5432/vertexlearn
+  REDIS_URL: redis://redis:6379
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev-access-secret-change-me-please}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev-refresh-secret-change-me-please}
+  FILE_URL_SECRET: ${FILE_URL_SECRET:-dev-file-url-secret-change-me}
+  AI_SERVICE_KEY: ${AI_SERVICE_KEY:-dev-internal-ai-key}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-vertexlearn-secret}
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vertex}
+    ports: ["127.0.0.1:5432:5432"] # for DBeaver / psql
+
+  redis:
+    ports: ["127.0.0.1:6379:6379"]
+
+  s3:
+    ports: ["127.0.0.1:8333:8333"]
+
+  # Fake email inbox: every email the app sends appears at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    ports: ["127.0.0.1:8025:8025", "127.0.0.1:1025:1025"]
+
+  ai-service:
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql://vertex:${POSTGRES_PASSWORD:-vertex}@postgres:5432/vertexlearn
+      AI_SERVICE_KEY: ${AI_SERVICE_KEY:-dev-internal-ai-key}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-vertexlearn-secret}
+      # Vertex AI credentials (Application Default Credentials), read-only, only inside this container.
+      # Point GCP_CREDENTIALS_DIR at the folder holding your key / `gcloud auth application-default login`
+      # file (see infra/gcp/README.md). A missing file simply means demo mode.
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/${GCP_CREDENTIALS_FILE:-application_default_credentials.json}
+    volumes:
+      - ${GCP_CREDENTIALS_DIR:-./infra/gcp}:/gcp:ro
+    ports: ["127.0.0.1:8000:8000"] # interactive API docs at http://localhost:8000/docs
+
+  backend:
+    environment: *dev-secrets
+    ports: ["127.0.0.1:4000:4000"]
+    depends_on:
+      mailpit: { condition: service_started }
+
+  worker:
+    environment: *dev-secrets
+    depends_on:
+      mailpit: { condition: service_started }

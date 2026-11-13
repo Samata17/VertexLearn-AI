@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+.pytest_cache
+.env
+.venv
+# Never bake Google Cloud credentials into the image (they are mounted at runtime)
+*.json
+!package.json
